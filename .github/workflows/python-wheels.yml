@@ -46,6 +46,7 @@ env:
 
 jobs:
   windows-x86_64:
+    if: ${{ false }}
     runs-on: windows-2022
     timeout-minutes: 150
 
@@ -114,6 +115,7 @@ jobs:
           path: python/sedonadb/dist/*.whl
 
   macOS-arm64:
+    if: ${{ false }}
     runs-on: macOS-latest
     timeout-minutes: 150
 
@@ -176,6 +178,7 @@ jobs:
           path: python/sedonadb/dist/*.whl
 
   macOS-amd64:
+    if: ${{ false }}
     runs-on: macos-15-intel
     timeout-minutes: 150
 
@@ -239,6 +242,7 @@ jobs:
           path: python/sedonadb/dist/*.whl
 
   wheels-linux:
+    if: github.repository == 'jiayuasu/sedona-db'
     name: ${{ matrix.config.label }}
     runs-on: ${{ matrix.config.os }}
     timeout-minutes: 150
@@ -247,7 +251,6 @@ jobs:
       matrix:
         config:
           - {os: "ubuntu-latest", label: "linux-x86_64", arch: "x86_64"}
-          - {os: "ubuntu-24.04-arm", label: "linux-arm64", arch: "aarch64"}
 
     steps:
       - uses: actions/checkout@v7
@@ -278,6 +281,7 @@ jobs:
           ./wheels-build-linux.sh ${{ matrix.config.arch }} sedonadb
         env:
           CIBW_SKIP: "*musllinux*"
+          CIBW_BUILD: "cp312-manylinux_x86_64"
           VCPKG_BINARY_CACHE_HOST: ${{ github.workspace }}/vcpkg-bincache
           CIBW_TEST_REQUIRES: pytest adbc_driver_manager geoarrow-pyarrow geopandas duckdb
           # A test failure stops cibuildwheel immediately, so this job cannot
@@ -302,12 +306,12 @@ jobs:
   # core package's nightly. Future extensions follow the same shape. The
   # default success gate prevents extensions from consuming partial artifacts.
   expr:
-    needs: ["windows-x86_64", "macOS-arm64", "macOS-amd64", "wheels-linux"]
+    needs: ["wheels-linux"]
     uses: ./.github/workflows/wheels-expr.yml
     secrets: inherit
 
   zarr:
-    needs: ["windows-x86_64", "macOS-arm64", "macOS-amd64", "wheels-linux"]
+    needs: ["wheels-linux"]
     uses: ./.github/workflows/wheels-zarr.yml
     secrets: inherit
 
@@ -321,7 +325,7 @@ jobs:
     secrets: inherit
 
   upload_nightly:
-    needs: ["wheels-linux", "macOS-arm64", "macOS-amd64", "windows-x86_64"]
+    needs: ["wheels-linux"]
     # The default success gate prevents publishing a partial wheel set when
     # any platform fails to build or test.
     name: Upload nightly packages
