@@ -1,0 +1,151 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: pyogrio-reader-stress
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_REF: 580d480f750618f8affeb77abbb956e6eeaee0ce
+
+jobs:
+  linux-cp312:
+    # This diagnostic is intentionally limited to the fork so it cannot consume
+    # shared Apache runners if the branch is later opened against upstream.
+    if: github.repository == 'jiayuasu/sedona-db'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'true'
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-wheel-build
+
+      - name: Restore vcpkg binaries
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-bincache
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-${{ hashFiles('ci/scripts/custom-triplets/**', 'ci/scripts/wheels-bootstrap-vcpkg.sh') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-
+
+      - name: Build wheel and stress concurrent OGR reads
+        run: |
+          cd ci/scripts
+          ./wheels-build-linux.sh x86_64 sedonadb
+        env:
+          CIBW_BUILD: cp312-manylinux_x86_64
+          CIBW_SKIP: "*musllinux*"
+          VCPKG_BINARY_CACHE_HOST: ${{ github.workspace }}/vcpkg-bincache
+
+          # Recreate the native Python stack from the cp312 failure in Apache
+          # run 32079721612 (August 17, 2026).
+          CIBW_TEST_REQUIRES: >-
+            adbc-driver-manager==1.12.0
+            certifi==2026.7.22
+            duckdb==1.5.5
+            geoarrow-c==0.3.1
+            geoarrow-pyarrow==0.2.0
+            geoarrow-types==0.3.0
+            geopandas==1.1.4
+            iniconfig==2.3.0
+            numpy==2.5.2
+            packaging==26.3
+            pandas==3.0.5
+            pluggy==1.6.0
+            pyarrow==25.0.1
+            pygments==2.21.0
+            pyogrio==0.13.0
+            pyproj==3.7.2
+            pytest==9.1.1
+            python-dateutil==2.9.0.post0
+            shapely==2.1.2
+            six==1.17.0
+            typing-extensions==4.16.0
+
+          # cibuildwheel's manylinux container only receives host variables
+          # listed here. Keep crash diagnostics and stress bounds explicit.
+          CIBW_ENVIRONMENT_PASS_LINUX: >-
+            PYTHONFAULTHANDLER
+            RUST_BACKTRACE
+            RUST_LIB_BACKTRACE
+            PYOGRIO_FAULTHANDLER_TIMEOUT_SECONDS
+            PYOGRIO_FULL_SUITE_TIMEOUT_SECONDS
+            PYOGRIO_IN_PROCESS_REPEATS
+            PYOGRIO_IN_PROCESS_TIMEOUT_SECONDS
+            PYOGRIO_PROCESS_REPEATS
+            PYOGRIO_PROCESS_TIMEOUT_SECONDS
+          PYTHONFAULTHANDLER: "1"
+          RUST_BACKTRACE: full
+          RUST_LIB_BACKTRACE: full
+          PYOGRIO_FAULTHANDLER_TIMEOUT_SECONDS: "45"
+          PYOGRIO_FULL_SUITE_TIMEOUT_SECONDS: "300"
+          PYOGRIO_IN_PROCESS_REPEATS: "100"
+          PYOGRIO_IN_PROCESS_TIMEOUT_SECONDS: "300"
+          PYOGRIO_PROCESS_REPEATS: "100"
+          PYOGRIO_PROCESS_TIMEOUT_SECONDS: "90"
+
+          # Every Python process has a pytest faulthandler deadline and a
+          # stricter external lifetime. An abort is propagated immediately;
+          # a hang prints Python stacks at 45 seconds and is killed at its
+          # phase deadline. `set -e` stops on the first non-zero status.
+          CIBW_TEST_COMMAND: >-
+            bash -euxo pipefail -c '
+              test_file="{package}/tests/io/test_pyogrio.py";
+              run_with_timeout() {
+                local timeout_seconds="$1";
+                shift;
+                timeout --foreground --signal=TERM --kill-after=15s "${timeout_seconds}s" "$@";
+              };
+              run_pytest() {
+                local timeout_seconds="$1";
+                shift;
+                run_with_timeout "$timeout_seconds" python -X faulthandler -m pytest "$@" -o "faulthandler_timeout=${PYOGRIO_FAULTHANDLER_TIMEOUT_SECONDS}";
+              };
+              python -m pip freeze;
+              echo "phase 1/3: full pyogrio suite";
+              run_pytest "${PYOGRIO_FULL_SUITE_TIMEOUT_SECONDS}" "$test_file" -vv;
+              echo "phase 2/3: ${PYOGRIO_IN_PROCESS_REPEATS} repetitions in one process";
+              run_with_timeout "${PYOGRIO_IN_PROCESS_TIMEOUT_SECONDS}" python -X faulthandler "{package}/../../ci/scripts/pyogrio-reader-stress.py" --test-file "$test_file" --repetitions "${PYOGRIO_IN_PROCESS_REPEATS}" --faulthandler-timeout "${PYOGRIO_FAULTHANDLER_TIMEOUT_SECONDS}";
+              echo "phase 3/3: ${PYOGRIO_PROCESS_REPEATS} fresh processes";
+              for iteration in $(seq 1 "${PYOGRIO_PROCESS_REPEATS}"); do
+                echo "fresh-process iteration ${iteration}/${PYOGRIO_PROCESS_REPEATS}";
+                run_pytest "${PYOGRIO_PROCESS_TIMEOUT_SECONDS}" "$test_file" -q -k "test_read_ogr_multi_file or test_read_ogr_partitioned";
+              done
+            '
+
+      - name: Save vcpkg binaries
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-bincache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
