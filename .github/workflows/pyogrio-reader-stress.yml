@@ -1,0 +1,77 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: pyogrio-reader-stress
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_REF: 580d480f750618f8affeb77abbb956e6eeaee0ce
+
+jobs:
+  linux-cp312:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'true'
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-wheel-build
+
+      - name: Restore vcpkg binaries
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-bincache
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-${{ hashFiles('ci/scripts/custom-triplets/**', 'ci/scripts/wheels-bootstrap-vcpkg.sh') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ env.VCPKG_REF }}-
+
+      - name: Build wheel and repeat concurrent OGR reads
+        run: |
+          cd ci/scripts
+          ./wheels-build-linux.sh x86_64 sedonadb
+        env:
+          CIBW_BUILD: cp312-manylinux_x86_64
+          CIBW_SKIP: "*musllinux*"
+          VCPKG_BINARY_CACHE_HOST: ${{ github.workspace }}/vcpkg-bincache
+          CIBW_TEST_REQUIRES: pytest geoarrow-pyarrow geopandas
+          CIBW_TEST_COMMAND: >-
+            bash -euxo pipefail -c 'python -m pip freeze; for iteration in $(seq 1 100); do echo "pyogrio stress iteration ${iteration}/100"; python -X faulthandler -m pytest {package}/tests/io/test_pyogrio.py -q -k "test_read_ogr_multi_file or test_read_ogr_partitioned"; done'
+          PYTHONFAULTHANDLER: "1"
+          RUST_BACKTRACE: full
+
+      - name: Save vcpkg binaries
+        if: always() && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/vcpkg-bincache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
